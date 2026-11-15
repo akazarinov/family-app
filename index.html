@@ -55,15 +55,15 @@ const API = "https://script.google.com/macros/s/AKfycbw4GFk5QIZWfQaOoKH4azN_3wA0
 const tg = window.Telegram && window.Telegram.WebApp;
 const INIT = (tg && tg.initData) || "";
 const START = (tg && tg.initDataUnsafe && tg.initDataUnsafe.start_param) || new URLSearchParams(location.search).get("a") || "";
+const UID = String((tg && tg.initDataUnsafe && tg.initDataUnsafe.user && tg.initDataUnsafe.user.id) || "anon");
 document.documentElement.dataset.theme = (tg && tg.colorScheme) || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
 if (tg) { tg.ready(); tg.expand(); tg.onEvent("themeChanged", () => document.documentElement.dataset.theme = tg.colorScheme); }
 const $ = (s) => document.querySelector(s);
 const esc = (t) => String(t == null ? "" : t).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const ddmm = (iso) => { const m = String(iso || "").match(/^\d{4}-(\d{2})-(\d{2})T(\d{2}:\d{2})/); return m ? `${m[2]}/${m[1]} ${m[3]}` : ""; };
+const nowIso = () => { const d = new Date(Date.now() + 4 * 3600e3); return d.toISOString().slice(0, 16); };   // Dubai time
 const haptic = (k) => { try { tg && tg.HapticFeedback.impactOccurred(k || "light"); } catch (e) {} };
-let pending = 0;
-const saving = (d) => { pending += d; $("#fam-saving").classList.toggle("on", pending > 0); };
-function showError(e) { $("#fam-error").innerHTML = `<div class="fam-banner">${esc(e && e.message || e)}</div>`; }
+function showError(e) { $("#fam-error").innerHTML = e ? `<div class="fam-banner">${esc(e && e.message || e)}</div>` : ""; }
 async function api(op, args) {
   if (!INIT) throw new Error("Откройте из Telegram");
   const r = await fetch(API, { method: "POST", body: JSON.stringify(Object.assign({ op: op, initData: INIT }, args || {})) });
@@ -71,90 +71,155 @@ async function api(op, args) {
   if (!j.ok) throw new Error(j.error || "Ошибка");
   return j.result;
 }
-let ME = null, timer = null;
+/* on-phone storage: the last copy of each artifact / list (instant opening) and the not-yet-saved changes */
+const store = {
+  get: (k) => { try { return JSON.parse(localStorage.getItem("fam:" + UID + ":" + k) || "null"); } catch (e) { return null; } },
+  put: (k, v) => { try { localStorage.setItem("fam:" + UID + ":" + k, JSON.stringify(v)); } catch (e) {} },
+};
+/* the save queue: changes are on screen at once; saved together ~0.3 s after the last tap, retried until they land */
+function Queue(name, send) {
+  const q = { ops: store.get("q:" + name) || [], busy: false, timer: null, fails: 0 };
+  const pill = $("#fam-saving");
+  const show = () => { pill.textContent = q.fails ? "Нет связи — сохраню позже" : "Сохраняю…"; pill.classList.toggle("on", q.ops.length > 0 || q.busy); };
+  q.push = (op) => { q.ops.push(op); store.put("q:" + name, q.ops); show(); clearTimeout(q.timer); q.timer = setTimeout(q.flush, 300); };
+  q.flush = async () => {
+    if (q.busy || !q.ops.length) return show();
+    q.busy = true; const batch = q.ops.slice(); show();
+    try {
+      const fresh = await send(batch);
+      q.ops = q.ops.slice(batch.length); store.put("q:" + name, q.ops); q.fails = 0;
+      q.onFresh && q.onFresh(fresh);
+    } catch (e) {
+      q.fails++; setTimeout(q.flush, Math.min(30000, 1500 * 2 ** q.fails));
+      if (q.fails >= 4) showError("Не удаётся сохранить: проверьте интернет. Изменения сохранены на телефоне и уйдут сами.");
+    }
+    q.busy = false; show();
+    if (q.ops.length && !q.fails) q.flush();
+  };
+  q.beacon = () => { if (q.ops.length && INIT) { try { navigator.sendBeacon(API, JSON.stringify(Object.assign({ initData: INIT }, send.beacon(q.ops)))); } catch (e) {} } };
+  return q;
+}
+let current = null, timer = null;   // current = the open queue; flushed when the app is hidden or closed
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden" && current) current.beacon(); });
 function back(fn) { if (!tg) return; tg.BackButton.offClick(tg.__back || (() => {})); tg.__back = fn; if (fn) { tg.BackButton.onClick(fn); tg.BackButton.show(); } else tg.BackButton.hide(); }
 
-/* ---------------- window.fam: the toolkit custom artifacts use (same contract as the Apps Script shell) ---------------- */
-function makeFam(id, page) {
-  const api_ = { id: id, user: page.user, error: showError, haptic: haptic,
+/* ---------------- custom artifacts: window.fam (same contract as before; set / del now return at once) ---------------- */
+function openArtifact(page, fromPicker) {
+  clearInterval(timer); showError(null);
+  const id = page.id;
+  let server = page.state || {};
+  const q = Queue("art:" + id, (ops) => api("art-batch", { id, ops }));
+  q.send = null; q.beacon = ((b) => () => { if (q.ops.length) try { navigator.sendBeacon(API, JSON.stringify({ initData: INIT, op: "art-batch", id, ops: q.ops })); } catch (e) {} })();
+  current = q;
+  const view = () => {   // server state + my unsaved changes on top
+    const st = Object.assign({}, server);
+    for (const o of q.ops) { if (o.del) delete st[o.k]; else st[o.k] = { v: o.v, by: page.user.name, at: nowIso() }; }
+    return st;
+  };
+  const watchers = [];
+  q.onFresh = (fresh) => { server = fresh; store.put("art:" + id, Object.assign({}, page, { state: server })); };
+  const fam = { id, user: page.user, error: showError, haptic,
     values: (st) => Object.fromEntries(Object.entries(st || {}).map(([k, x]) => [k, x.v])),
-    state: () => api("art-state", { id }),
-    set: async (k, v) => { saving(1); haptic(); try { return await api("art-set", { id, k, value: v }); } catch (e) { showError(e); throw e; } finally { saving(-1); } },
-    del: async (k) => { saving(1); try { return await api("art-del", { id, k }); } catch (e) { showError(e); throw e; } finally { saving(-1); } },
-    watch: (cb, ms) => { timer = setInterval(async () => { if (!pending && document.visibilityState === "visible") cb(await api_.state()); }, ms || 12000); return timer; } };
-  api_.ready = Promise.resolve({ user: page.user, state: page.state });
-  return api_;
-}
-async function openArtifact(id, fromPicker) {
-  clearInterval(timer); $("#fam-error").innerHTML = "";
-  const page = await api("art-page", { id });
+    state: async () => { if (!q.ops.length && !q.busy) { try { server = await api("art-state", { id }); store.put("art:" + id, Object.assign({}, page, { state: server })); } catch (e) {} } return view(); },
+    set: (k, v) => { haptic(); q.push({ k, v }); return Promise.resolve(view()); },
+    del: (k) => { q.push({ k, del: true }); return Promise.resolve(view()); },
+    watch: (cb, ms) => { watchers.push(cb); timer = setInterval(async () => { if (document.visibilityState === "visible") cb(await fam.state()); }, ms || 12000); return timer; } };
+  fam.ready = Promise.resolve({ user: page.user, state: view() });
+  window.fam = fam;
   document.title = page.title;
-  window.fam = makeFam(id, page);
   const root = $("#root"); root.innerHTML = page.html;
-  for (const old of [...root.querySelectorAll("script")]) {   // innerHTML does not run scripts: re-create them in order
-    // each artifact script in its own function scope: its names never clash with ours or another script's
-    const s = document.createElement("script"); s.textContent = "(function(){\n" + old.textContent + "\n})();"; old.replaceWith(s);
+  for (const old of [...root.querySelectorAll("script")]) {   // each artifact script in its own function scope
+    const sc = document.createElement("script"); sc.textContent = "(function(){\n" + old.textContent + "\n})();"; old.replaceWith(sc);
   }
   back(fromPicker ? () => showPicker() : null);
+  if (q.ops.length) q.flush();   // changes left from last time
+  return { refresh: (fresh) => { server = fresh.state || server; store.put("art:" + id, Object.assign({}, page, { state: server })); watchers.forEach((cb) => cb(view())); } };
 }
 
 /* ---------------- built-in shared lists ---------------- */
-let L = null, slug = "";
+let L = null, LQ = null, slug = "";
+function listView() {   // server list + my unsaved changes on top
+  const d = JSON.parse(JSON.stringify(L));
+  for (const o of LQ.ops) {
+    if (o.op === "toggle") d.sections.forEach((s) => s.items.forEach((i) => { if (i.id === o.id) { i.done = o.done; i.by = ME_NAME; } }));
+    if (o.op === "remove") d.sections.forEach((s) => { s.items = s.items.filter((i) => i.id !== o.id); });
+    if (o.op === "add") { const s = d.sections.find((x) => x.name === o.section); if (s) s.items.push({ id: o.tmp, text: o.text, done: false, by: ME_NAME }); }
+  }
+  return d;
+}
+let ME_NAME = "";
 function renderList() {
+  const D = listView();
   let done = 0, total = 0;
-  const secs = L.sections.map((s, si) => {
+  const secs = D.sections.map((s, si) => {
     const n = s.items.filter((i) => i.done).length; done += n; total += s.items.length;
     const lis = s.items.map((i) => `<li class="${i.done ? "done" : ""}" data-id="${i.id}"><label><input type="checkbox" ${i.done ? "checked" : ""}>
       <span>${esc(i.text)}</span>${i.done && i.by ? `<em class="who">${esc(i.by)}</em>` : ""}</label><button class="rm" aria-label="Удалить">×</button></li>`).join("");
     return `<h2>${esc(s.name)}<span>✔ ${n} / ${s.items.length}</span></h2><ul>${lis || '<li><label><span class="muted">пусто</span></label></li>'}</ul>
       <form class="add" data-sec="${si}"><input placeholder="Добавить в «${esc(s.name)}»" enterkeyhint="done"><button aria-label="Добавить">+</button></form>`;
   }).join("");
-  $("#root").innerHTML = `<div class="wrap lst"><div class="kicker">Семья · общий список</div><h1>${esc(L.title)}</h1>
-    <div class="muted">Изменения сразу видны всем · обновлено ${esc(ddmm(L.updated))}</div>${secs}</div>
+  const focus = document.activeElement && document.activeElement.closest && document.activeElement.closest("form.add");
+  const fi = focus ? focus.dataset.sec : null;
+  $("#root").innerHTML = `<div class="wrap lst"><div class="kicker">Семья · общий список</div><h1>${esc(D.title)}</h1>
+    <div class="muted">Изменения сразу видны всем · обновлено ${esc(ddmm(D.updated))}</div>${secs}</div>
     <div class="bar"><div>Отмечено</div><span>✔ ${done} / ${total}</span></div>`;
+  if (fi !== null) { const inp = document.querySelector(`form.add[data-sec="${fi}"] input`); inp && inp.focus(); }
 }
-async function openList(s, fromPicker) {
-  clearInterval(timer); slug = s; L = await api("get", { slug }); document.title = L.title; renderList();
-  timer = setInterval(async () => { if (!pending && document.visibilityState === "visible") { L = await api("get", { slug }); renderList(); } }, 12000);
+function openList(list, userName, fromPicker) {
+  clearInterval(timer); showError(null); slug = list.slug; L = list; ME_NAME = userName;
+  LQ = Queue("list:" + slug, (ops) => api("list-batch", { slug, ops }));
+  LQ.beacon = () => { if (LQ.ops.length) try { navigator.sendBeacon(API, JSON.stringify({ initData: INIT, op: "list-batch", slug, ops: LQ.ops })); } catch (e) {} };
+  LQ.onFresh = (fresh) => { L = fresh; store.put("list:" + slug, L); renderList(); };
+  current = LQ; document.title = L.title; renderList();
+  timer = setInterval(async () => {
+    if (document.visibilityState !== "visible" || LQ.ops.length || LQ.busy) return;
+    try { L = await api("get", { slug }); store.put("list:" + slug, L); if (!document.activeElement || !document.activeElement.closest("form.add")) renderList(); } catch (e) {}
+  }, 12000);
   back(fromPicker ? () => showPicker() : null);
+  if (LQ.ops.length) LQ.flush();
+  return { refresh: (fresh) => { if (!LQ.ops.length && !LQ.busy) { L = fresh.list; store.put("list:" + slug, L); renderList(); } } };
 }
-document.addEventListener("change", async (ev) => {
+document.addEventListener("change", (ev) => {
   const li = ev.target.closest(".lst li[data-id]"); if (!li) return;
-  li.classList.add("pending"); saving(1); haptic();
-  try { L = await api("toggle", { slug, id: li.dataset.id, done: ev.target.checked }); } catch (e) { showError(e); }
-  saving(-1); renderList();
+  haptic(); LQ.push({ op: "toggle", id: li.dataset.id, done: ev.target.checked }); renderList();
 });
-document.addEventListener("click", async (ev) => {
+document.addEventListener("click", (ev) => {
   const b = ev.target.closest(".lst button.rm"); if (!b) return;
   const li = b.closest("li[data-id]"); if (!confirm("Удалить «" + li.innerText.replace("×", "").trim() + "»?")) return;
-  li.classList.add("pending"); saving(1);
-  try { L = await api("remove", { slug, id: li.dataset.id }); } catch (e) { showError(e); }
-  saving(-1); renderList();
+  LQ.push({ op: "remove", id: li.dataset.id }); renderList();
 });
-document.addEventListener("submit", async (ev) => {
+document.addEventListener("submit", (ev) => {
   const f = ev.target.closest(".lst form.add"); if (!f) return;
   ev.preventDefault(); const inp = f.querySelector("input"), t = inp.value.trim(); if (!t) return;
-  inp.value = ""; saving(1); haptic();
-  try { L = await api("add", { slug, section: L.sections[+f.dataset.sec].name, text: t }); } catch (e) { showError(e); }
-  saving(-1); renderList();
+  inp.value = ""; haptic();
+  LQ.push({ op: "add", section: listView().sections[+f.dataset.sec].name, text: t, tmp: "tmp" + Date.now() }); renderList();
 });
 
-/* ---------------- start ---------------- */
+/* ---------------- start: paint the last copy at once, then refresh from the server in one round trip ---------------- */
+let PICK = null;
 function showPicker() {
-  clearInterval(timer); back(null); document.title = "Family";
-  const items = ME.artifacts.map((a) => `<button data-a="${esc(a.id)}">✨ ${esc(a.title)}</button>`)
-    .concat(ME.lists.map((l) => `<button data-l="${esc(l.slug)}">📋 ${esc(l.title)}</button>`)).join("");
-  $("#root").innerHTML = `<div class="wrap"><div class="kicker">Семья</div><h1>Что открыть?</h1><div class="pick">${items || '<p class="muted">Пока пусто</p>'}</div></div>`;
-  document.querySelectorAll(".pick button").forEach((b) => b.onclick = () => (b.dataset.a ? openArtifact(b.dataset.a, true) : openList(b.dataset.l, true)).catch(showError));
+  clearInterval(timer); back(null); current = null; document.title = "Family";
+  const P = PICK || store.get("picker") || { lists: [], artifacts: [] };
+  const items = P.artifacts.map((a) => `<button data-a="${esc(a.id)}">✨ ${esc(a.title)}</button>`)
+    .concat(P.lists.map((l) => `<button data-l="${esc(l.slug)}">📋 ${esc(l.title)}</button>`)).join("");
+  $("#root").innerHTML = `<div class="wrap"><div class="kicker">Семья</div><h1>Что открыть?</h1><div class="pick">${items || '<p class="muted">Загружаю…</p>'}</div></div>`;
+  document.querySelectorAll(".pick button").forEach((b) => b.onclick = () => go(b.dataset.a || b.dataset.l, true));
 }
-(async () => {
+async function go(start, fromPicker) {
+  const cachedArt = store.get("art:" + start), cachedList = store.get("list:" + start);
+  let shown = null;
+  if (cachedArt) shown = openArtifact(cachedArt, fromPicker);
+  else if (cachedList) shown = openList(cachedList, (store.get("me") || {}).name || "", fromPicker);
   try {
-    ME = await api("me");
-    if (START && ME.artifacts.some((a) => a.id === START)) return await openArtifact(START, false);
-    if (START && ME.lists.some((l) => l.slug === START)) return await openList(START, false);
-    showPicker();
-  } catch (e) { $("#root").innerHTML = ""; showError(e); }
-})();
+    const r = await api("open", { start });
+    store.put("me", r.user);
+    if (r.type === "art") { store.put("art:" + start, r.page); if (shown && cachedArt && cachedArt.html === r.page.html) shown.refresh(r.page); else openArtifact(r.page, fromPicker); }
+    else if (r.type === "list") { store.put("list:" + start, r.list); if (shown && cachedList) shown.refresh(r); else openList(r.list, r.user.name, fromPicker); }
+    else { PICK = r; store.put("picker", { lists: r.lists, artifacts: r.artifacts }); showPicker(); }
+  } catch (e) { if (!shown) $("#root").innerHTML = ""; showError(e); }
+}
+if (START) go(START, false);
+else { showPicker(); api("open", { start: "" }).then((r) => { store.put("me", r.user); PICK = r; store.put("picker", { lists: r.lists, artifacts: r.artifacts }); showPicker(); }).catch(showError); }
 })();
 </script>
 </body>
