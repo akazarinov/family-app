@@ -205,18 +205,32 @@ function showPicker() {
   $("#root").innerHTML = `<div class="wrap"><div class="kicker">Семья</div><h1>Что открыть?</h1><div class="pick">${items || '<p class="muted">Загружаю…</p>'}</div></div>`;
   document.querySelectorAll(".pick button").forEach((b) => b.onclick = () => go(b.dataset.a || b.dataset.l, true));
 }
+const LIVE = new Set(["captcha"]);   // changes every time (a fresh screenshot): never paint an old copy first
+function syncBadge(on) {   // "обновляю…" while a cached copy is on screen and the fresh one is on its way
+  let b = document.getElementById("syncing");
+  if (!on) { if (b) b.remove(); return; }
+  if (!b) { b = document.createElement("div"); b.id = "syncing"; b.textContent = "⟳ Обновляю…";
+    b.style.cssText = "position:fixed;top:8px;right:8px;z-index:50;padding:4px 10px;border-radius:999px;font-size:13px;" +
+      "background:var(--tg-theme-secondary-bg-color,#eee);color:var(--tg-theme-hint-color,#777);box-shadow:0 1px 4px rgba(0,0,0,.12)";
+    document.body.appendChild(b); }
+}
 async function go(start, fromPicker) {
-  const cachedArt = store.get("art:" + start), cachedList = store.get("list:" + start);
+  const live = LIVE.has(start);
+  const cachedArt = live ? null : store.get("art:" + start), cachedList = store.get("list:" + start);
   let shown = null;
-  if (cachedArt) shown = openArtifact(cachedArt, fromPicker);
+  if (live) $("#root").innerHTML = '<div class="wrap"><div class="kicker">Проверка</div><h1>Загружаю свежую картинку…</h1>' +
+    '<p class="muted">Пара секунд — показываю только актуальную проверку.</p></div>';
+  else if (cachedArt) shown = openArtifact(cachedArt, fromPicker);
   else if (cachedList) shown = openList(cachedList, (store.get("me") || {}).name || "", fromPicker);
+  if (shown) syncBadge(true);
   try {
     const r = await api("open", { start });
+    syncBadge(false);
     store.put("me", r.user);
     if (r.type === "art") { store.put("art:" + start, r.page); if (shown && cachedArt && cachedArt.html === r.page.html) shown.refresh(r.page); else openArtifact(r.page, fromPicker); }
     else if (r.type === "list") { store.put("list:" + start, r.list); if (shown && cachedList) shown.refresh(r); else openList(r.list, r.user.name, fromPicker); }
     else { PICK = r; store.put("picker", { lists: r.lists, artifacts: r.artifacts }); showPicker(); }
-  } catch (e) { if (!shown) $("#root").innerHTML = ""; showError(e); }
+  } catch (e) { syncBadge(false); if (!shown) $("#root").innerHTML = ""; showError(e); }
 }
 if (START) go(START, false);
 else { showPicker(); api("open", { start: "" }).then((r) => { store.put("me", r.user); PICK = r; store.put("picker", { lists: r.lists, artifacts: r.artifacts }); showPicker(); }).catch(showError); }
