@@ -29,6 +29,8 @@
   .fam-banner { padding:12px 14px; border-radius:var(--radius); border:1px solid var(--bad); color:var(--bad); background:var(--card); margin:12px 16px; }
   .fam-saving { position:fixed; right:12px; top:12px; font-size:13px; color:var(--muted); background:var(--card); border:1px solid var(--line);
                 border-radius:99px; padding:4px 10px; visibility:hidden; z-index:9; } .fam-saving.on { visibility:visible; }
+  .fam-frame { position:fixed; inset:0; width:100%; height:100%; border:0; background:var(--bg); z-index:1; }
+  #fam-error { position:relative; z-index:5; }
   /* built-in shared lists */
   .lst h2 { display:flex; justify-content:space-between; } .lst h2 span { color:var(--ok); font-size:14px; }
   .lst ul { list-style:none; margin:0; padding:0; background:var(--card); border:1px solid var(--line); border-radius:var(--radius); overflow:hidden; }
@@ -59,6 +61,7 @@ const UID = String((tg && tg.initDataUnsafe && tg.initDataUnsafe.user && tg.init
 document.documentElement.dataset.theme = (tg && tg.colorScheme) || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
 if (tg) { tg.ready(); tg.expand(); tg.onEvent("themeChanged", () => document.documentElement.dataset.theme = tg.colorScheme); }
 const $ = (s) => document.querySelector(s);
+const BASE_CSS = document.querySelector("style").textContent.split("/* built-in shared lists */")[0];   // the design system, for module frames
 const esc = (t) => String(t == null ? "" : t).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const ddmm = (iso) => { const m = String(iso || "").match(/^\d{4}-(\d{2})-(\d{2})T(\d{2}:\d{2})/); return m ? `${m[2]}/${m[1]} ${m[3]}` : ""; };
 const nowIso = () => { const d = new Date(Date.now() + 4 * 3600e3); return d.toISOString().slice(0, 16); };   // Dubai time
@@ -103,38 +106,99 @@ let current = null, timer = null;   // current = the open queue; flushed when th
 document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden" && current) current.beacon(); });
 function back(fn) { if (!tg) return; tg.BackButton.offClick(tg.__back || (() => {})); tg.__back = fn; if (fn) { tg.BackButton.onClick(fn); tg.BackButton.show(); } else tg.BackButton.hide(); }
 
-/* ---------------- custom artifacts: window.fam (same contract as before; set / del now return at once) ---------------- */
+/* ---------------- custom artifacts: each one an isolated module in its own sandboxed frame ----------------
+   Code (cached on the phone by hash: `open` sends it only when it changed), data (JSON the agent replaces) and shared
+   state. The frame has no access to this page, the login or other modules; it gets window.fam through messages
+   (same contract as before, plus fam.data), a Telegram.WebApp stand-in (BackButton, HapticFeedback, openLink) and its
+   own localStorage. Replacing one module never touches another. */
+const BRIDGE = function (I) {   // runs inside the frame, before the module's own scripts
+  let st = I.state, seq = 0; const pend = {}, watchers = [], backFns = new Set();
+  const post = (m) => parent.postMessage(Object.assign({ famFrame: I.nonce }, m), "*");
+  const ask = (m) => new Promise((ok) => { const n = ++seq; pend[n] = ok; post(Object.assign({ n }, m)); });
+  const nowIso = () => new Date(Date.now() + 4 * 3600e3).toISOString().slice(0, 16);
+  addEventListener("message", (e) => {
+    if (e.source !== parent) return; const d = e.data || {};
+    if (d.n && pend[d.n]) { pend[d.n](d.r); delete pend[d.n]; }
+    if (d.push === "state") { st = d.r; watchers.forEach((cb) => { try { cb(st); } catch (x) {} }); }
+    if (d.push === "back") backFns.forEach((fn) => { try { fn(); } catch (x) {} });
+    if (d.push === "theme") document.documentElement.dataset.theme = d.r;
+  });
+  const fam = { id: I.id, user: I.user, data: I.data, error: (e) => post({ op: "error", e: e ? String(e.message || e) : "" }),
+    haptic: (k) => post({ op: "haptic", k }),
+    values: (s) => Object.fromEntries(Object.entries(s || {}).map(([k, x]) => [k, x.v])),
+    state: () => ask({ op: "state" }).then((r) => (st = r)),
+    set: (k, v) => { st = Object.assign({}, st, { [k]: { v, by: I.user.name, at: nowIso() } }); post({ op: "set", k, v }); return Promise.resolve(st); },
+    del: (k) => { st = Object.assign({}, st); delete st[k]; post({ op: "del", k }); return Promise.resolve(st); },
+    fresh: () => ask({ op: "data" }).then((r) => (fam.data = r)),
+    watch: (cb, ms) => { watchers.push(cb); return setInterval(async () => { if (document.visibilityState === "visible") cb(await fam.state()); }, ms || 12000); } };
+  fam.ready = Promise.resolve({ user: I.user, state: st, data: I.data });
+  window.fam = fam;
+  const bb = { onClick: (fn) => backFns.add(fn), offClick: (fn) => backFns.delete(fn), show: () => post({ op: "back", on: true }), hide: () => post({ op: "back", on: false }) };
+  window.Telegram = { WebApp: { initData: "", initDataUnsafe: { user: I.user }, colorScheme: I.theme, platform: I.platform, BackButton: bb,
+    HapticFeedback: { impactOccurred: (k) => post({ op: "haptic", k }), notificationOccurred: () => post({ op: "haptic" }), selectionChanged: () => {} },
+    openLink: (u) => post({ op: "link", u: String(u) }), ready: () => {}, expand: () => {}, onEvent: () => {}, offEvent: () => {} } };
+  const mem = Object.assign({}, I.ls), ls = { getItem: (k) => (k in mem ? mem[k] : null), key: (i) => (i < Object.keys(mem).length ? Object.keys(mem)[i] : null),
+    setItem: (k, v) => { mem[k] = String(v); post({ op: "ls", k: String(k), v: String(v) }); },
+    removeItem: (k) => { delete mem[k]; post({ op: "ls", k: String(k), v: null }); },
+    clear: () => Object.keys(mem).forEach(ls.removeItem), get length() { return Object.keys(mem).length; } };
+  try { Object.defineProperty(window, "localStorage", { value: ls, configurable: true }); } catch (e) {}
+  document.addEventListener("click", (e) => {   // links leave through Telegram, not inside the frame
+    const a = e.target.closest && e.target.closest("a[href]"); if (!a || /^#|^javascript:/i.test(a.getAttribute("href"))) return;
+    e.preventDefault(); post({ op: "link", u: a.href });
+  });
+};
+let frameMsg = null;   // the open module's message handler
 function openArtifact(page, fromPicker) {
   clearInterval(timer); showError(null);
-  const id = page.id;
-  let server = page.state || {};
+  const id = page.id, nonce = Math.random().toString(36).slice(2);
+  let server = page.state || {}, artBack = false;
   const q = Queue("art:" + id, (ops) => api("art-batch", { id, ops }));
-  q.send = null; q.beacon = ((b) => () => { if (q.ops.length) try { navigator.sendBeacon(API, JSON.stringify({ initData: INIT, op: "art-batch", id, ops: q.ops })); } catch (e) {} })();
+  q.beacon = () => { if (q.ops.length) try { navigator.sendBeacon(API, JSON.stringify({ initData: INIT, op: "art-batch", id, ops: q.ops })); } catch (e) {} };
   current = q;
   const view = () => {   // server state + my unsaved changes on top
     const st = Object.assign({}, server);
     for (const o of q.ops) { if (o.del) delete st[o.k]; else st[o.k] = { v: o.v, by: page.user.name, at: nowIso() }; }
     return st;
   };
-  const watchers = [];
-  q.onFresh = (fresh) => { server = fresh; store.put("art:" + id, Object.assign({}, page, { state: server })); };
-  const fam = { id, user: page.user, error: showError, haptic,
-    values: (st) => Object.fromEntries(Object.entries(st || {}).map(([k, x]) => [k, x.v])),
-    state: async () => { if (!q.ops.length && !q.busy) { try { server = await api("art-state", { id }); store.put("art:" + id, Object.assign({}, page, { state: server })); } catch (e) {} } return view(); },
-    set: (k, v) => { haptic(); q.push({ k, v }); return Promise.resolve(view()); },
-    del: (k) => { q.push({ k, del: true }); return Promise.resolve(view()); },
-    watch: (cb, ms) => { watchers.push(cb); timer = setInterval(async () => { if (document.visibilityState === "visible") cb(await fam.state()); }, ms || 12000); return timer; } };
-  fam.ready = Promise.resolve({ user: page.user, state: view() });
-  window.fam = fam;
+  const keep = () => store.put("art:" + id, Object.assign({}, page, { html: undefined, state: server }, LIVE.has(id) ? { data: null } : {}));
+  q.onFresh = (fresh) => { server = fresh; keep(); };
+  keep();
   document.title = page.title;
-  const root = $("#root"); root.innerHTML = page.html;
-  for (const old of [...root.querySelectorAll("script")]) {   // each artifact script in its own function scope
-    const sc = document.createElement("script"); sc.textContent = "(function(){\n" + old.textContent + "\n})();"; old.replaceWith(sc);
-  }
-  back(fromPicker ? () => showPicker() : null);
+  const root = $("#root"); root.innerHTML = "";
+  const fr = document.createElement("iframe");
+  fr.className = "fam-frame"; fr.title = page.title;
+  fr.setAttribute("sandbox", "allow-scripts allow-modals allow-forms allow-popups allow-popups-to-escape-sandbox");
+  const init = { id, nonce, user: page.user, state: view(), data: page.data == null ? null : page.data, ls: store.get("ls:" + id) || {},
+                 theme: document.documentElement.dataset.theme, platform: (tg && tg.platform) || "" };
+  fr.srcdoc = '<!doctype html><html lang="ru" data-theme="' + init.theme + '"><head><meta charset="utf-8">' +
+    '<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><style>' + BASE_CSS + "</style>" +
+    "<script>(" + BRIDGE.toString() + ")(" + JSON.stringify(init).replace(/</g, "\\u003c") + ");<\/script></head><body>" + page.html + "</body></html>";
+  const reply = (d, r) => fr.contentWindow && fr.contentWindow.postMessage({ n: d.n, r }, "*");
+  const toFrame = (m) => fr.contentWindow && fr.contentWindow.postMessage(m, "*");
+  const setBack = () => back(artBack ? () => toFrame({ push: "back" }) : fromPicker ? () => showPicker() : null);
+  if (frameMsg) removeEventListener("message", frameMsg);
+  frameMsg = async (e) => {
+    const d = e.data || {};
+    if (e.source !== fr.contentWindow || d.famFrame !== nonce) return;
+    if (d.op === "set") q.push({ k: d.k, v: d.v });
+    else if (d.op === "del") q.push({ k: d.k, del: true });
+    else if (d.op === "state") {
+      if (!q.ops.length && !q.busy) { try { server = await api("art-state", { id }); keep(); } catch (x) {} }
+      reply(d, view());
+    } else if (d.op === "data") { let r = page.data; try { r = page.data = await api("art-data", { id }); } catch (x) {} reply(d, r); }
+    else if (d.op === "error") showError(d.e || null);
+    else if (d.op === "haptic") haptic(d.k);
+    else if (d.op === "back") { artBack = !!d.on; setBack(); }
+    else if (d.op === "link" && /^https?:/i.test(d.u)) { if (tg && tg.openLink) tg.openLink(d.u); else window.open(d.u, "_blank", "noopener"); }
+    else if (d.op === "ls") { const m = store.get("ls:" + id) || {}; if (d.v === null) delete m[d.k]; else m[d.k] = d.v; store.put("ls:" + id, m); }
+  };
+  addEventListener("message", frameMsg);
+  root.appendChild(fr);
+  setBack();
   if (q.ops.length) q.flush();   // changes left from last time
-  return { refresh: (fresh) => { server = fresh.state || server; store.put("art:" + id, Object.assign({}, page, { state: server })); watchers.forEach((cb) => cb(view())); } };
+  return { refresh: (fresh) => { server = fresh.state || server; page.data = fresh.data === undefined ? page.data : fresh.data; keep(); toFrame({ push: "state", r: view() }); } };
 }
+if (tg) tg.onEvent("themeChanged", () => { const f = document.querySelector(".fam-frame"); if (f && f.contentWindow) f.contentWindow.postMessage({ push: "theme", r: tg.colorScheme }, "*"); });
 
 /* ---------------- built-in shared lists ---------------- */
 let L = null, LQ = null, slug = "";
@@ -199,6 +263,7 @@ document.addEventListener("submit", (ev) => {
 let PICK = null;
 function showPicker() {
   clearInterval(timer); back(null); current = null; document.title = "Family";
+  if (frameMsg) { removeEventListener("message", frameMsg); frameMsg = null; }
   const P = PICK || store.get("picker") || { lists: [], artifacts: [] };
   const items = P.artifacts.map((a) => `<button data-a="${esc(a.id)}">✨ ${esc(a.title)}</button>`)
     .concat(P.lists.map((l) => `<button data-l="${esc(l.slug)}">📋 ${esc(l.title)}</button>`)).join("");
@@ -214,9 +279,14 @@ function syncBadge(on) {   // "обновляю…" while a cached copy is on sc
       "background:var(--tg-theme-secondary-bg-color,#eee);color:var(--tg-theme-hint-color,#777);box-shadow:0 1px 4px rgba(0,0,0,.12)";
     document.body.appendChild(b); }
 }
+// a module's code stays on the phone by hash; `open` sends the code only when it changed
+const withCode = (page) => { const mod = store.get("mod:" + page.id);
+  if (page.html != null) { store.put("mod:" + page.id, { hash: page.hash, html: page.html }); return page; }
+  return mod && mod.hash === page.hash ? Object.assign({}, page, { html: mod.html }) : null; };
 async function go(start, fromPicker) {
-  const live = LIVE.has(start);
-  const cachedArt = live ? null : store.get("art:" + start), cachedList = store.get("list:" + start);
+  const live = LIVE.has(start);   // the code is cached all the same; only its data must be fresh
+  const art = live ? null : store.get("art:" + start), mod = store.get("mod:" + start);
+  const cachedArt = art && mod && art.hash === mod.hash ? Object.assign({}, art, { html: mod.html }) : null, cachedList = store.get("list:" + start);
   let shown = null;
   if (live) $("#root").innerHTML = '<div class="wrap"><div class="kicker">Проверка</div><h1>Загружаю свежую картинку…</h1>' +
     '<p class="muted">Пара секунд — показываю только актуальную проверку.</p></div>';
@@ -224,7 +294,9 @@ async function go(start, fromPicker) {
   else if (cachedList) shown = openList(cachedList, (store.get("me") || {}).name || "", fromPicker);
   if (shown) syncBadge(true);
   try {
-    const r = await api("open", { start });
+    let r = await api("open", { start, have: mod && mod.hash });
+    if (r.type === "art" && !r.evicted && !withCode(r.page)) r = await api("open", { start });   // phone copy gone: the code too
+    if (r.type === "art" && r.page && !r.evicted) r.page = withCode(r.page);
     syncBadge(false);
     store.put("me", r.user);
     if (r.type === "art" && r.evicted) {   // moved to the agent's archive: it is loaded back within ~15 s
@@ -233,12 +305,12 @@ async function go(start, fromPicker) {
       for (let i = 0; i < 40; i++) {
         await new Promise((ok) => setTimeout(ok, 4000));
         const again = await api("open", { start }).catch(() => null);
-        if (again && again.type === "art" && !again.evicted) { store.put("art:" + start, again.page); openArtifact(again.page, fromPicker); return; }
+        if (again && again.type === "art" && !again.evicted) { const pg = withCode(again.page); openArtifact(pg, fromPicker); return; }
       }
       if (!shown) $("#root").innerHTML = '<div class="wrap"><h1>Не получилось подгрузить</h1><p class="muted">Попросите агента в чате открыть «' + esc(r.page.title) + '».</p></div>';
       return;
     }
-    if (r.type === "art") { store.put("art:" + start, r.page); if (shown && cachedArt && cachedArt.html === r.page.html) shown.refresh(r.page); else openArtifact(r.page, fromPicker); }
+    if (r.type === "art") { if (shown && cachedArt && cachedArt.hash === r.page.hash && JSON.stringify(cachedArt.data) === JSON.stringify(r.page.data)) shown.refresh(r.page); else openArtifact(r.page, fromPicker); }
     else if (r.type === "list") { store.put("list:" + start, r.list); if (shown && cachedList) shown.refresh(r); else openList(r.list, r.user.name, fromPicker); }
     else { PICK = r; store.put("picker", { lists: r.lists, artifacts: r.artifacts }); showPicker(); }
   } catch (e) { syncBadge(false); if (!shown) $("#root").innerHTML = ""; showError(e); }
