@@ -227,6 +227,17 @@ async function go(start, fromPicker) {
     const r = await api("open", { start });
     syncBadge(false);
     store.put("me", r.user);
+    if (r.type === "art" && r.evicted) {   // moved to the agent's archive: it is loaded back within ~15 s
+      if (!shown) $("#root").innerHTML = '<div class="wrap"><div class="kicker">' + esc(r.page.title) + '</div>' +
+        '<h1>Подгружаю из архива…</h1><p class="muted">Обычно 10–20 секунд, страница откроется сама.</p></div>';
+      for (let i = 0; i < 40; i++) {
+        await new Promise((ok) => setTimeout(ok, 4000));
+        const again = await api("open", { start }).catch(() => null);
+        if (again && again.type === "art" && !again.evicted) { store.put("art:" + start, again.page); openArtifact(again.page, fromPicker); return; }
+      }
+      if (!shown) $("#root").innerHTML = '<div class="wrap"><h1>Не получилось подгрузить</h1><p class="muted">Попросите агента в чате открыть «' + esc(r.page.title) + '».</p></div>';
+      return;
+    }
     if (r.type === "art") { store.put("art:" + start, r.page); if (shown && cachedArt && cachedArt.html === r.page.html) shown.refresh(r.page); else openArtifact(r.page, fromPicker); }
     else if (r.type === "list") { store.put("list:" + start, r.list); if (shown && cachedList) shown.refresh(r); else openList(r.list, r.user.name, fromPicker); }
     else { PICK = r; store.put("picker", { lists: r.lists, artifacts: r.artifacts }); showPicker(); }
